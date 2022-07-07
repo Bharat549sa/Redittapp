@@ -1,0 +1,336 @@
+package com.reddit.postsubmit.self
+
+import android.annotation.SuppressLint
+import android.os.Bundle
+import android.text.TextUtils
+import android.view.LayoutInflater
+import android.view.MenuItem
+import android.view.View
+import android.view.ViewGroup
+import android.widget.EditText
+import android.widget.LinearLayout
+import android.widget.TextView
+import androidx.annotation.VisibleForTesting
+import androidx.core.view.isVisible
+import androidx.core.widget.doOnTextChanged
+import com.bluelinelabs.conductor.RouterTransaction
+import com.reddit.di.builder.provideComponentBuilder
+import com.reddit.domain.economy.features.GoldFeatures
+import com.reddit.domain.model.ErrorField
+import com.reddit.domain.model.PostType
+import com.reddit.domain.model.SubmitGeneralParameters
+import com.reddit.domain.model.Subreddit
+import com.reddit.domain.model.mod.SchedulePostModel
+import com.reddit.domain.model.postsubmit.PostTraditionData
+import com.reddit.events.ScreenPageData
+import com.reddit.events.builders.CommentEventBuilder
+import com.reddit.events.comment.CommentAnalytics
+import com.reddit.events.deeplink.DeepLinkAnalytics
+import com.reddit.events.deeplink.DeepLinkable
+import com.reddit.frontpage.ui.widgets.KeyboardExtensionsViewBehavior
+import com.reddit.logging.lodestone.Lodestone
+import com.reddit.postsubmit.common.BasePostSubmitScreen
+import com.reddit.postsubmit.self.di.SelfPostSubmitComponent
+import com.reddit.postsubmit.util.SubmitDeepLink
+import com.reddit.screen.common.Navigable
+import com.reddit.screen.composewidgets.KeyboardExtensionsContract
+import com.reddit.screen.composewidgets.KeyboardExtensionsScreen
+import com.reddit.screen.composewidgets.KeyboardExtensionsTargetScreen
+import com.reddit.screen.deeplinking.ScreenDeepLinker
+import com.reddit.screen.util.doAfterAttach
+import com.reddit.screen.util.fromLayout
+import com.reddit.screen.util.manageableViewLazy
+import com.reddit.screen.widget.ScreenContainerView
+import com.reddit.screens.postsubmit.R
+import com.reddit.themes.ResourcesUtil
+import com.reddit.ui.KeyboardUtil
+import com.reddit.ui.padForSystemBars
+import kotlinx.android.parcel.Parcelize
+import timber.log.Timber
+import javax.inject.Inject
+import com.reddit.themes.R as ThemesR
+
+class SelfPostSubmitScreen :
+ BasePostSubmitScreen(),
+ SelfPostSubmitContract.View,
+ DeepLinkable,
+ KeyboardExtensionsTargetScreen {
+
+ override val layoutId: Int = R.layout.screen_post_submit_self
+
+ @SuppressLint("NotDetachingPresenter") // Handled by base class
+ @Inject
+ override lateinit var presenter: SelfPostSubmitContract.Presenter
+
+ @Inject
+ lateinit var goldFeatures: GoldFeatures
+
+ private val submitText: EditText by fromLayout(R.id.submit_text)
+ private val scheduleLayout: View by fromLayout(R.id.schedule_button)
+ private val buttonsContainer: LinearLayout by fromLayout(R.id.buttons_container)
+ private val scheduleText: TextView by fromLayout(R.id.schedule_text)
+ private val scheduleNewBadge: TextView by fromLayout(R.id.schedule_new_badge)
+
+ private var defaultText: String? = null
+ private var traditionData: PostTraditionData? = null
+   set(value) {
+     field = value
+     schedulePostModel = value?.schedulePostModel
+   }
+
+ override val contentType: PostType = PostType.SELF
+
+ override val titleRes: Int
+   get() = R.string.title_submit_self
+
+ override val toolbarMenuResId: Int = R.menu.menu_submit
+
+ @Inject
+ lateinit var commentAnalytics: CommentAnalytics
+
+ @VisibleForTesting
+ val keyboardExtensionsViewBehavior by manageableViewLazy {
+   KeyboardExtensionsViewBehavior(
+     getKeyboardParentView = { rootView as ViewGroup },
+     getTextInputView = { submitText },
+     keyboardHeaderViewStubId = R.id.keyboard_header_stub,
+     screenSourceForAnalytics = CommentEventBuilder.Source.POST_COMPOSER,
+     commentAnalytics = commentAnalytics
+   )
+ }
+
+ private var keyboardExtensionsScreen: KeyboardExtensionsScreen? = null
+
+ private val keyboardExtensionsScreenContainer: ScreenContainerView by fromLayout(R.id.keyboard_extensions_screen_container)
+
+ private fun createKeyboardExtensionsParams(): KeyboardExtensionsContract.Params {
+   return KeyboardExtensionsContract.Params.Simple(
+     screenSourceForAnalytics = CommentEventBuilder.Source.POST_COMPOSER,
+     enableSpoilerNsfw = true,
+     enableAddLink = false
+   )
+ }
+
+ override val textInputView: EditText
+   get() = submitText
+
+ override fun onInitialize() {
+   super.onInitialize()
+
+   activity!!.provideComponentBuilder<SelfPostSubmitComponent.Factory>()
+     .build(
+       view = this,
+       context = { activity!! },
+       parameters = SelfPostSubmitContract.Parameters(deeplinkSubredditName),
+       navigable = this as Navigable
+     )
+     .inject(this)
+ }
+
+ private var schedulingAvailable: Boolean = false
+
+ override var deepLinkAnalytics: DeepLinkAnalytics? = null
+
+ override val analyticsScreenData: ScreenPageData = ScreenPageData(
+   super.analyticsScreenData.v2AnalyticsPageType
+ )
+
+ override fun onCreateView(
+   inflater: LayoutInflater,
+   container: ViewGroup
+ ): View {
+   val view = super.onCreateView(inflater, container)
+   defaultText?.let {
+     submitText.setText(it)
+   }
+   traditionData?.let {
+     submitTitleView.apply {
+       setText(it.title)
+       requestFocus()
+     }
+     submitText.setText(it.text)
+     setSchedule()
+     updateSubmitButton()
+   }
+   submitTitleView.doOnTextChanged { _, _, _, _ ->
+     updateSubmitButton()
+   }
+   submitText.doOnTextChanged { _, _, _, _ ->
+     updateSubmitButton()
+   }
+   submitText.setOnFocusChangeListener { _, hasFocus ->
+     if (hasFocus) {
+       if (goldFeatures.keyboardExtensionsRefactorEnabled) {
+         keyboardExtensionsScreen!!.enableAddLink()
+       } else {
+         keyboardExtensionsViewBehavior.enableAddLink()
+       }
+     } else {
+       if (goldFeatures.keyboardExtensionsRefactorEnabled) {
+         keyboardExtensionsScreen!!.disableAddLink()
+       } else {
+         keyboardExtensionsViewBehavior.disableAddLink()
+       }
+     }
+     if (!hasFocus && contentErrorView.visibility == View.VISIBLE) {
+       hideValidationErrorOnFocusChange(ErrorField.BODY)
+     }
+   }
+   if (goldFeatures.keyboardExtensionsRefactorEnabled && keyboardExtensionsScreen == null) {
+     val router = getChildRouter(keyboardExtensionsScreenContainer)
+
+     keyboardExtensionsScreen = KeyboardExtensionsScreen(createKeyboardExtensionsParams()).apply {
+       targetScreen = this@SelfPostSubmitScreen
+     }.also {
+       router.setRoot(RouterTransaction.with(it))
+     }
+   } else {
+     keyboardExtensionsViewBehavior.enableSpoilerNsfw()
+     keyboardExtensionsViewBehavior.setHeaderVisibility(View.VISIBLE)
+   }
+   buttonsContainer.padForSystemBars(top = false, bottom = true)
+   scheduleLayout.setOnClickListener {
+     (selectedSubredditData ?: originSubreddit)?.let(presenter::onScheduleClick)
+   }
+   presenter.onEvaluateScheduleButtonVisibility(selectedSubredditData ?: originSubreddit)
+   return view
+ }
+
+ override fun onToolbarMenuItemClick(menuItem: MenuItem): Boolean {
+   when (menuItem.itemId) {
+     R.id.action_submit -> onClickSubmit()
+   }
+   return true
+ }
+
+ override fun setScheduleButtonVisibility(isVisible: Boolean) {
+   schedulingAvailable = isVisible
+   scheduleLayout.isVisible = isVisible
+ }
+
+ override fun onSaveInstanceState(outState: Bundle) {
+   super.onSaveInstanceState(outState)
+   outState.putString(KEY_DEFAULT_TEXT, defaultText)
+   outState.putParcelable(KEY_TRADITION_DATA, traditionData)
+ }
+
+ override fun onRestoreInstanceState(savedInstanceState: Bundle) {
+   super.onRestoreInstanceState(savedInstanceState)
+   defaultText = savedInstanceState.getString(KEY_DEFAULT_TEXT)
+   traditionData = savedInstanceState.getParcelable(KEY_TRADITION_DATA)
+ }
+
+ override fun onSubmit() {
+   Lodestone.Scenario.PostSubmission.begin("text")
+   KeyboardUtil.hideKeyboard(activity!!)
+   val submitSubredditName = submitSubredditName ?: run {
+     Timber.e("Failed to submit, submitSubredditName is null")
+     return
+   }
+   val isNsfw = if (goldFeatures.keyboardExtensionsRefactorEnabled)
+     keyboardExtensionsScreen!!.isNsfw
+   else
+     keyboardExtensionsViewBehavior.isNsfw
+   val isSpoiler = if (goldFeatures.keyboardExtensionsRefactorEnabled)
+     keyboardExtensionsScreen!!.isSpoiler
+   else
+     keyboardExtensionsViewBehavior.isSpoiler
+
+   presenter.submitPost(
+     SubmitGeneralParameters(
+       PostType.SELF,
+       submitSubredditName,
+       submitTitleView.text.toString(),
+       submitText.text.toString(),
+       flairText,
+       flairId,
+       discussionType,
+       isNsfw,
+       isSpoiler
+     ),
+     schedulePostModel.takeIf { schedulingAvailable }
+   )
+ }
+
+ override val isFormValid: Boolean
+   get() {
+     if (TextUtils.isEmpty(submitTitleView.text.toString())) {
+       showErrorToast(R.string.error_title_missing)
+       return false
+     }
+     return super.isFormValid
+   }
+
+ override fun setEditTextHints() {
+   if (isPromoter) {
+     submitTitleView.setHint(R.string.submit_self_title_hint_promoter)
+     submitText.setHint(R.string.submit_self_body_hint_promoter)
+   } else {
+     submitTitleView.setHint(R.string.submit_title_hint)
+     submitText.setHint(R.string.submit_self_body_hint)
+   }
+ }
+
+ override fun onSchedulePicked(schedulePostModel: SchedulePostModel?) {
+   super.onSchedulePicked(schedulePostModel)
+   doAfterAttach {
+     setSchedule()
+   }
+ }
+
+ override fun updateScheduleNewBadgeVisibility(isVisible: Boolean) {
+   scheduleNewBadge.isVisible = isVisible
+ }
+
+ private fun setSchedule() {
+   presenter.onSchedulePicked(schedulePostModel)
+   scheduleText.apply {
+     val textColorAttr = if (schedulePostModel != null) {
+       ThemesR.attr.rdt_ds_color_tone1
+     } else {
+       ThemesR.attr.rdt_ds_color_tone2
+     }
+     setTextColor(ResourcesUtil.getColorFromAttr(activity!!, textColorAttr))
+     setText(if (schedulePostModel != null) R.string.action_scheduled_post else R.string.action_schedule_post)
+   }
+ }
+
+ companion object {
+   private const val KEY_DEFAULT_TEXT = "default_text"
+   private const val KEY_TRADITION_DATA = "tradition_data"
+
+   @JvmStatic
+   fun newInstance(
+     title: String?,
+     subreddit: Subreddit?, // TODO replace with just subreddit name (SubredditScreenArg) to avoid oversized bundle
+     textToShare: String?,
+     postTraditionData: PostTraditionData?
+   ): SelfPostSubmitScreen {
+     val screen = SelfPostSubmitScreen()
+     screen.title = title
+     screen.originSubreddit = subreddit
+     screen.defaultText = textToShare
+     screen.traditionData = postTraditionData
+     return screen
+   }
+ }
+
+ @Parcelize
+ class DeepLinker(
+   val deepLink: SubmitDeepLink.SelfDeepLink,
+   override val deepLinkAnalytics: DeepLinkAnalytics?
+ ) : ScreenDeepLinker<SelfPostSubmitScreen>(deepLinkAnalytics) {
+   override fun createScreenInternal(): SelfPostSubmitScreen {
+     return newInstance(
+       title = deepLink.title,
+       subreddit = null,
+       textToShare = deepLink.text,
+       postTraditionData = null
+     ).apply {
+       args.run {
+         deepLink.subreddit?.let { putString(DEEPLINK_SUBREDDIT_NAME_ARG, it) }
+       }
+     }
+   }
+ }
+}

@@ -1,0 +1,935 @@
+package com.reddit.screen.composewidgets
+
+import android.annotation.SuppressLint
+import android.content.Context
+import android.graphics.drawable.Drawable
+import android.graphics.drawable.DrawableWrapper
+import android.graphics.drawable.LayerDrawable
+import android.os.Bundle
+import android.text.Editable
+import android.text.SpannableString
+import android.text.TextWatcher
+import android.text.style.ImageSpan
+import android.util.Size
+import android.view.LayoutInflater
+import android.view.View
+import android.view.ViewGroup
+import android.widget.EditText
+import androidx.annotation.RestrictTo
+import androidx.appcompat.app.AlertDialog
+import androidx.core.os.bundleOf
+import androidx.core.text.getSpans
+import androidx.core.view.doOnLayout
+import androidx.recyclerview.widget.GridLayoutManager
+import androidx.recyclerview.widget.LinearLayoutManager
+import androidx.recyclerview.widget.RecyclerView
+import androidx.recyclerview.widget.RecyclerView.NO_POSITION
+import androidx.transition.ChangeBounds
+import androidx.transition.TransitionManager
+import androidx.transition.TransitionSet
+import com.reddit.common.composewidgets.OptionalContentFeature
+import com.reddit.common.richcontent.Emote
+import com.reddit.composewidgets.R
+import com.reddit.composewidgets.databinding.ScreenKeyboardExtensionsBinding
+import com.reddit.di.builder.provideComponentBuilder
+import com.reddit.domain.economy.features.GoldFeatures
+import com.reddit.domain.model.MediaMetaData
+import com.reddit.domain.navigation.ScreenNavigator
+import com.reddit.domain.richcontent.EMOJI_UPLOAD_ALLOWED_MIME_TYPES
+import com.reddit.domain.richcontent.Gif
+import com.reddit.domain.richcontent.KeyboardFeatureStatus
+import com.reddit.domain.richcontent.PreProcessedFile
+import com.reddit.events.builders.CommentEventBuilder
+import com.reddit.events.comment.CommentAnalytics
+import com.reddit.frontpage.dialog.LinkComposerAlertDialog
+import com.reddit.frontpage.presentation.GIF_DOWNSIZED_ID_SUFFIX
+import com.reddit.frontpage.presentation.MarkdownCommentWithMediaRenderer
+import com.reddit.frontpage.presentation.MediaReplacement
+import com.reddit.frontpage.ui.listing.PaddingItemDecoration
+import com.reddit.frontpage.ui.widgets.KeyboardExtensionsHeaderView
+import com.reddit.frontpage.util.kotlin.inflate
+import com.reddit.screen.Screen
+import com.reddit.screen.changehandler.addListener
+import com.reddit.screen.image.cameraroll.ImagesPickedTarget
+import com.reddit.screen.util.PermissionUtil
+import com.reddit.screen.util.doAfterAttach
+import com.reddit.screen.util.manageableViewLazy
+import com.reddit.screen.util.viewBinding
+import com.reddit.themes.RedditThemedActivity
+import com.reddit.ui.AnchoringDirection
+import com.reddit.ui.CoachmarkUiModel
+import com.reddit.ui.CoachmarkView
+import com.reddit.ui.GridAutofitLayoutManager
+import com.reddit.ui.KeyboardUtil
+import com.reddit.ui.TailGravity
+import com.reddit.ui.button.RedditButton
+import com.reddit.ui.fullstory.FullStoryUi
+import com.reddit.ui.fullstory.FullStoryUnmaskedElement
+import com.reddit.ui.hide
+import com.reddit.ui.richcontent.EmoteAction
+import com.reddit.ui.richcontent.EmoteDisplayedItem
+import com.reddit.ui.richcontent.EmotesRecyclerAdapter
+import com.reddit.ui.richcontent.GifsRecyclerAdapter
+import com.reddit.ui.show
+import com.reddit.ui.toast.RedditToast
+import com.reddit.ui.toast.ToastPresentationModel
+import com.reddit.ui.utils.toActivity
+import com.reddit.utility_screens.select_option.listeners.SelectedOptionListener
+import com.reddit.utility_screens.select_option.model.SelectOptionUiModel
+import io.reactivex.subjects.PublishSubject
+import java.util.WeakHashMap
+import javax.inject.Inject
+import kotlin.math.max
+import kotlin.math.min
+import com.reddit.themes.R as ThemesR
+import com.reddit.ui.richcontent.R as RichContentUiR
+
+@RestrictTo(RestrictTo.Scope.LIBRARY)
+class KeyboardExtensionsScreen(args: Bundle) :
+ Screen(args),
+ KeyboardExtensionsContract.View,
+ TextWatcher,
+ ImagesPickedTarget,
+ SelectedOptionListener {
+
+ override val layoutId = R.layout.screen_keyboard_extensions
+
+ private val binding: ScreenKeyboardExtensionsBinding by viewBinding(ScreenKeyboardExtensionsBinding::bind)
+
+ @Inject
+ lateinit var presenter: KeyboardExtensionsContract.Presenter
+
+ @Inject
+ lateinit var screenNavigator: ScreenNavigator
+
+ @Inject
+ lateinit var commentAnalytics: CommentAnalytics
+
+ @Inject
+ lateinit var goldFeatures: GoldFeatures
+
+ private var emotesFeatureStatus: KeyboardFeatureStatus = KeyboardFeatureStatus.Unavailable
+ private var gifsStatus: KeyboardFeatureStatus = KeyboardFeatureStatus.Unavailable
+ private var addLinkEnabled = false
+ private var spoilerNsfwEnabled = false
+ private var emotesForKeyboard: List<EmoteDisplayedItem>? = null
+
+ override val gifsScrolledToEnd = PublishSubject.create<Unit>()
+
+ override val lockedExtensionTapped = PublishSubject.create<OptionalContentFeature>()
+ private var maxAllowedEmojiUploadImages: Int? = null
+
+ private val emotesContentView: ViewGroup by manageableViewLazy { createEmotesContentView(binding.keyboardHeader) }
+ private val emotesRecyclerView: RecyclerView by manageableViewLazy { emotesContentView.findViewById(RichContentUiR.id.keyboardContent) }
+ private val emotesUnlockButton: RedditButton by manageableViewLazy { emotesContentView.findViewById(RichContentUiR.id.unlock_button) }
+ private val emotesRecyclerAdapter by manageableViewLazy {
+   EmotesRecyclerAdapter { emoteAction ->
+     when (emoteAction) {
+       is EmoteAction.EmoteClick -> onEmoteItemClick(emoteAction.emote)
+       is EmoteAction.AddClick -> presenter.onAddEmojisClick(emoteAction.maxImagesAllowed)
+       is EmoteAction.EmoteLongClick -> onEmoteItemLongClick(emoteAction.emote)
+     }
+   }
+ }
+
+ private val gifsContentView: RecyclerView by manageableViewLazy { createGifsContentView(binding.keyboardHeader) }
+ private val gifsRecyclerAdapter by manageableViewLazy { GifsRecyclerAdapter(::onGifItemClick) }
+
+ override val text: Editable
+   get() = getTextInputView().text
+
+ override var inputFieldHint: CharSequence?
+   get() = getTextInputView().hint
+   set(value) {
+     getTextInputView().hint = value
+   }
+
+ private fun getTextInputView() = (targetScreen as KeyboardExtensionsTargetScreen).textInputView
+
+ private val emotesMap = WeakHashMap<ImageSpan, Emote>()
+ private val gifsMap = WeakHashMap<ImageSpan, Gif>()
+
+ private var bigEmotes = true
+ private var disableTextWatcher = true
+ private var deletedGifSpan: ImageSpan? = null
+
+ override val keyboardHeaderState = PublishSubject.create<KeyboardExtensionsHeaderView.KeyboardHeaderState>()
+
+ override val gifInserted = PublishSubject.create<Unit>()
+
+ override var autoOpenExtension: OptionalContentFeature? = null
+   set(value) {
+     field = value
+     doAfterAttach {
+       binding.keyboardHeader.autoOpenExtension = value
+     }
+   }
+
+ private val params: KeyboardExtensionsContract.Params by lazy(LazyThreadSafetyMode.NONE) {
+   args.get(ARG_PARAMETERS)!! as KeyboardExtensionsContract.Params
+ }
+
+ private val markdownRenderer = MarkdownCommentWithMediaRenderer()
+
+ constructor(params: KeyboardExtensionsContract.Params) : this(
+   bundleOf(ARG_PARAMETERS to params)
+ )
+
+ override fun onInitialize() {
+   super.onInitialize()
+
+   activity!!.provideComponentBuilder<KeyboardExtensionsScreenComponent.Factory>()
+     .build(
+       view = this,
+       activity = { activity!! },
+       context = { activity!! },
+       params = params
+     ).inject(this)
+ }
+
+ override fun onCreateView(inflater: LayoutInflater, container: ViewGroup): View {
+   val view = super.onCreateView(inflater, container)
+
+   binding.keyboardHeader.let {
+     FullStoryUi.unmask(FullStoryUnmaskedElement.SUBMIT_KEYBOARD_BUTTONS, it)
+     it.state.subscribe(::onKeyboardHeaderStateChanged)
+     getTextInputView().addTextChangedListener(this)
+     it.richContentFeatureClicked.filter { feature ->
+       when (feature) {
+         OptionalContentFeature.EMOJIS -> emotesFeatureStatus is KeyboardFeatureStatus.Locked
+         OptionalContentFeature.GIFS -> gifsStatus is KeyboardFeatureStatus.Locked
+       }
+     }.subscribe(lockedExtensionTapped)
+
+     it.richContentFeatureClicked.subscribe { feature ->
+       presenter.onRichContentFeatureClicked(feature)
+     }
+   }
+
+   if (params.enableAddLink) {
+     enableAddLink()
+   }
+   if (params.enableSpoilerNsfw) {
+     enableSpoilerNsfw()
+   }
+
+   (params as? KeyboardExtensionsContract.Params.Simple)?.link?.let {
+     isNsfw = it.over18
+     isSpoiler = it.spoiler
+   }
+
+   (params as? KeyboardExtensionsContract.Params.Full)?.let {
+     if (it.markdownText != null) {
+       setInitialContentFromMarkdown(it.markdownText, it.mediaMetadata)
+     }
+   }
+
+   return view
+ }
+
+ private fun onKeyboardHeaderStateChanged(
+   keyboardHeaderState: KeyboardExtensionsHeaderView.KeyboardHeaderState
+ ) {
+   when (keyboardHeaderState) {
+     is KeyboardExtensionsHeaderView.KeyboardHeaderState.Closed -> {
+       hideEmotesContentView(keyboardHeaderState.closeWithAnimation)
+       hideGifsContentView()
+       getTextInputView().requestFocus()
+     }
+     is KeyboardExtensionsHeaderView.KeyboardHeaderState.EmotePickerOpened -> {
+       hideGifsContentView()
+       if (keyboardHeaderState.animate) {
+         val transition = ChangeBounds().apply {
+           addListener(
+             onEnd = {
+               if (presenter.shouldShowEmojiDeleteTooltip()) {
+                 showEmojiDeleteTooltip()
+               }
+             }
+           )
+         }
+         (targetScreen?.rootView as? ViewGroup)?.let {
+           TransitionManager.beginDelayedTransition(it, transition)
+         }
+       }
+       emotesContentView.layoutHeight = keyboardHeaderState.keyboardHeight
+       if (!keyboardHeaderState.animate && goldFeatures.powerupsTooltipsChangesEnabled) {
+         showEmojiDeleteTooltip()
+       }
+     }
+     is KeyboardExtensionsHeaderView.KeyboardHeaderState.GifPickerOpened -> {
+       hideEmotesContentView(false)
+       gifsContentView.show()
+     }
+   }
+   this.keyboardHeaderState.onNext(keyboardHeaderState)
+ }
+
+ fun setHeaderVisibility(visibility: Int) {
+   if (!(gifsStatus.isVisible() || emotesFeatureStatus.isVisible() || addLinkEnabled || spoilerNsfwEnabled)) return
+   doAfterAttach {
+     binding.keyboardHeader.visibility = visibility
+   }
+ }
+
+ fun enableAddLink() {
+   addLinkEnabled = true
+   doAfterAttach {
+     binding.keyboardHeader.allowAddLink = true
+     binding.keyboardHeader.setAddLinkClickListener { showLinkComposerModal() }
+   }
+ }
+
+ fun disableAddLink() {
+   addLinkEnabled = false
+   if (isAttached) {
+     binding.keyboardHeader.allowAddLink = false
+     binding.keyboardHeader.setAddLinkClickListener {}
+   }
+ }
+
+ override fun onAttach(view: View) {
+   super.onAttach(view)
+   presenter.attach()
+
+   val textInputView = getTextInputView()
+   if (autoOpenExtension != OptionalContentFeature.EMOJIS &&
+     binding.keyboardHeader.state.value !is KeyboardExtensionsHeaderView.KeyboardHeaderState.EmotePickerOpened
+   ) {
+     textInputView.post {
+       KeyboardUtil.showKeyboard(textInputView.context.toActivity())
+     }
+   }
+ }
+
+ override fun onDetach(view: View) {
+   super.onDetach(view)
+   presenter.detach()
+ }
+
+ override fun onDeinitialize() {
+   super.onDeinitialize()
+   presenter.destroy()
+ }
+
+ private fun createEmotesContentView(keyboard: KeyboardExtensionsHeaderView): ViewGroup {
+   val emotesContentView = keyboard.inflate(RichContentUiR.layout.emotes_keyboard_content).apply {
+     keyboard.addView(this)
+   } as ViewGroup
+   val emotesRecyclerView =
+     emotesContentView.findViewById<RecyclerView>(RichContentUiR.id.keyboardContent)
+   emotesRecyclerView.adapter = emotesRecyclerAdapter
+   val context = emotesContentView.context
+   emotesRecyclerView.layoutManager = GridAutofitLayoutManager(
+     emotesContentView.context,
+     context.resources.getDimensionPixelSize(RichContentUiR.dimen.keyboard_emote_size_with_padding)
+   ).apply {
+     spanSizeLookup = object : GridLayoutManager.SpanSizeLookup() {
+       init {
+         isSpanIndexCacheEnabled = true
+       }
+
+       override fun getSpanSize(position: Int): Int {
+         val item = emotesForKeyboard?.get(position)
+         return if (item !is EmoteDisplayedItem.HeaderItem) {
+           EMOTE_SPAN_COUNT
+         } else {
+           spanCount
+         }
+       }
+     }
+   }
+   return emotesContentView
+ }
+
+ private fun onEmoteItemClick(emote: Emote) {
+   val editText = getTextInputView()
+   val insertPosition = editText.selectionEnd
+   val emoteSpannable = markdownRenderer.getEmoteAsSpannable(
+     editText,
+     emote,
+     emotesMap,
+     bigEmotes,
+   )
+   editText.text.insert(insertPosition, emoteSpannable)
+ }
+
+ private fun onEmoteItemLongClick(emote: Emote) {
+   presenter.onDeleteEmoteClick(emote)
+ }
+
+ private fun createGifsContentView(keyboard: KeyboardExtensionsHeaderView): RecyclerView {
+   val gifsContentView = keyboard.inflate(RichContentUiR.layout.gifs_keyboard_content) as RecyclerView
+   keyboard.addView(gifsContentView, GIFS_CONTENT_VIEW_POSITION)
+
+   val layoutManager = LinearLayoutManager(
+     gifsContentView.context,
+     LinearLayoutManager.HORIZONTAL,
+     false
+   )
+   gifsContentView.layoutManager = layoutManager
+
+   val itemPadding =
+     gifsContentView.resources.getDimensionPixelSize(RichContentUiR.dimen.gif_list_item_padding)
+   gifsContentView.addItemDecoration(
+     PaddingItemDecoration(
+       firstPadding = itemPadding,
+       lastPadding = itemPadding,
+       padding = itemPadding,
+       orientation = RecyclerView.HORIZONTAL
+     )
+   )
+
+   gifsContentView.adapter = gifsRecyclerAdapter
+
+   gifsContentView.addOnScrollListener(object : RecyclerView.OnScrollListener() {
+     override fun onScrolled(recyclerView: RecyclerView, dx: Int, dy: Int) {
+       super.onScrolled(recyclerView, dx, dy)
+       val lastVisibleItemPosition = layoutManager.findLastVisibleItemPosition()
+       if (lastVisibleItemPosition >= gifsRecyclerAdapter.itemCount - 1) {
+         gifsScrolledToEnd.onNext(Unit)
+       }
+     }
+   })
+   return gifsContentView
+ }
+
+ private fun onGifItemClick(gif: Gif) {
+   val editText = getTextInputView()
+   if (areGifsUsed(editText)) return
+   val insertPosition = editText.selectionEnd
+   val gifSpannable = markdownRenderer.getGifAsSpannable(editText, gif, gifsMap) ?: return
+   editText.text.insert(insertPosition, gifSpannable)
+   binding.keyboardHeader.close()
+   gifInserted.onNext(Unit)
+ }
+
+ private fun areGifsUsed(editText: EditText) =
+   editText.text.getSpans<ImageSpan>().any(gifsMap::containsKey)
+
+ override fun setEmotesStatus(status: KeyboardFeatureStatus) {
+   this.emotesFeatureStatus = status
+   binding.keyboardHeader.emotesFeatureStatus = status
+ }
+
+ override fun setEmoteItems(emoteDisplayedItems: List<EmoteDisplayedItem>) {
+   if (emotesFeatureStatus !is KeyboardFeatureStatus.Available) return
+
+   if (emoteDisplayedItems.any { it is EmoteDisplayedItem.EmoteItem && !it.isEnabled }) {
+     emotesUnlockButton.apply {
+       show()
+       setOnClickListener {
+         presenter.onUnlockEmojisClick()
+       }
+     }
+   } else {
+     emotesUnlockButton.hide()
+   }
+
+   disableTextWatcher = false
+   this.emotesForKeyboard = emoteDisplayedItems
+   emotesRecyclerAdapter.submitList(emotesForKeyboard)
+ }
+
+ private fun hideEmotesContentView(closeWithAnimation: Boolean) {
+   if (emotesFeatureStatus !is KeyboardFeatureStatus.Available) return
+   if (emotesContentView.layoutHeight == 0) return
+   if (closeWithAnimation) {
+     (targetScreen?.rootView as? ViewGroup)?.let {
+       TransitionManager.beginDelayedTransition(it, TransitionSet().addTransition(ChangeBounds()))
+     }
+   }
+   emotesContentView.layoutHeight = 0
+ }
+
+ override fun setGifsStatus(status: KeyboardFeatureStatus) {
+   gifsStatus = status
+   disableTextWatcher = false
+   binding.keyboardHeader.gifFeatureStatus = status
+ }
+
+ private fun hideGifsContentView() {
+   if (binding.keyboardHeader.gifFeatureStatus is KeyboardFeatureStatus.Available) {
+     gifsContentView.hide()
+   }
+ }
+
+ override fun enableSpoilerNsfw() {
+   spoilerNsfwEnabled = true
+   binding.keyboardHeader.allowSpoilerNsfw = true
+ }
+
+ override fun appendDisplayedGifs(gifs: List<Gif>) {
+   val insertPosition = gifsRecyclerAdapter.items.size
+   gifsRecyclerAdapter.items.addAll(gifs)
+   gifsRecyclerAdapter.notifyItemRangeInserted(insertPosition, gifs.size)
+ }
+
+ @SuppressLint("NotifyDataSetChanged")
+ override fun clearDisplayedGifs() {
+   gifsRecyclerAdapter.items.clear()
+   gifsRecyclerAdapter.notifyDataSetChanged()
+ }
+
+ override fun hideKeyboard() {
+   // without this extra ceremony, soft keyboard ends up not hidden if this is called while a popup window is showing :(
+   val textInputView = getTextInputView()
+   textInputView.post {
+     KeyboardUtil.hideKeyboard(activity!!, textInputView.windowToken)
+   }
+ }
+
+ override fun handleUp(): Boolean {
+   return true
+ }
+
+ fun checkHandleBack(): Boolean {
+   if ((
+     emotesFeatureStatus is KeyboardFeatureStatus.Available ||
+       gifsStatus is KeyboardFeatureStatus.Available
+     ) &&
+     !binding.keyboardHeader.isClosed
+   ) {
+     binding.keyboardHeader.close()
+     return true
+   }
+   return false
+ }
+
+ private fun setInitialContentFromMarkdown(
+   markdownText: String,
+   mediaMetadata: Map<String, MediaMetaData>?
+ ) {
+   val textInputView = getTextInputView()
+   val result = markdownRenderer.convertMarkdownToSpannable(
+     markdownText = markdownText,
+     mediaMetadata = mediaMetadata,
+     targetTextView = textInputView,
+     emotesMap = emotesMap,
+     gifsMap = gifsMap,
+   )
+
+   textInputView.setText(result.text)
+
+   bigEmotes = result.bigEmotes
+   if (result.gifsUsed) {
+     binding.keyboardHeader.showGifButton = false
+   }
+ }
+
+ override fun beforeTextChanged(s: CharSequence, start: Int, count: Int, after: Int) {
+   if (disableTextWatcher) return
+   if (count - after != 1) return
+
+   val deletedCharacterIndex = start + after
+   if (deletedCharacterIndex >= s.length) return
+
+   val deletedCharacter = s[deletedCharacterIndex]
+   if (deletedCharacter != '\n') return
+
+   val gifSpan = text.getSpans<ImageSpan>().find(gifsMap::containsKey) ?: return
+   if (getTextInputView().text.getSpanEnd(gifSpan) == deletedCharacterIndex) {
+     deletedGifSpan = gifSpan
+   }
+ }
+
+ override fun afterTextChanged(text: Editable) {
+   if (disableTextWatcher) return
+   val imageSpans = text.getSpans<ImageSpan>()
+
+   imageSpans.find(gifsMap::containsKey)?.let { gifSpan ->
+     var startIndex = text.getSpanStart(gifSpan)
+     val endIndex = text.getSpanEnd(gifSpan)
+
+     disableTextWatcher = true
+
+     if (deletedGifSpan == gifSpan) {
+       deletedGifSpan = null
+
+       while (startIndex > 0 && text[startIndex - 1] == '\n') {
+         startIndex -= 1
+       }
+       text.replace(startIndex, endIndex, "\n")
+
+       binding.keyboardHeader.showGifButton = true
+     } else {
+       enforceNewlineAfter(text, endIndex)
+       enforceNewlineBefore(text, startIndex)
+
+       binding.keyboardHeader.showGifButton = false
+     }
+
+     disableTextWatcher = false
+   } ?: run {
+     binding.keyboardHeader.showGifButton = true
+   }
+
+   val emoteSpans = imageSpans.filter(emotesMap::containsKey)
+   val bigEmotesAfterChange = text.length <= MAX_NUMBER_OF_BIG_EMOTES &&
+     text.length == emoteSpans.size
+   if (bigEmotesAfterChange == bigEmotes) return
+   bigEmotes = bigEmotesAfterChange
+   updateEmoteSpansSize(emoteSpans)
+ }
+
+ override fun onTextChanged(s: CharSequence?, start: Int, before: Int, count: Int) {}
+
+ override val mediaReplacements: List<MediaReplacement>
+   get() {
+     val editText = getTextInputView()
+     return editText.text.getSpans<ImageSpan>().mapNotNull { span ->
+       val emote = emotesMap[span]
+       val gif = gifsMap[span]
+       if (emote != null || gif != null) {
+         MediaReplacement(
+           editText.text.getSpanStart(span),
+           editText.text.getSpanEnd(span),
+           emote = emote,
+           gif = gif
+         )
+       } else null
+     }.sortedBy { it.start }
+   }
+
+ var isNsfw
+   get() = binding.keyboardHeader.toggleNsfw.isChecked
+   set(value) {
+     doAfterAttach {
+       binding.keyboardHeader.toggleNsfw.isChecked = value
+     }
+   }
+ var isSpoiler
+   get() = binding.keyboardHeader.toggleSpoiler.isChecked
+   set(value) {
+     doAfterAttach {
+       binding.keyboardHeader.toggleSpoiler.isChecked = value
+     }
+   }
+
+ override fun openImagePicker(maxImagesAllowed: Int) {
+   this.maxAllowedEmojiUploadImages = maxImagesAllowed
+
+   if (PermissionUtil.verifyStoragePermissions(this, PermissionUtil.PERMISSION_IMAGES_STORAGE_REQUEST_CODE)) {
+     screenNavigator.navigateToCameraRoll(
+       context = activity!!,
+       targetScreen = this,
+       maxImagesSelectionCount = maxImagesAllowed,
+       mimeTypes = EMOJI_UPLOAD_ALLOWED_MIME_TYPES,
+       title = resources!!.getQuantityString(R.plurals.emoji_image_picker_title, maxImagesAllowed, maxImagesAllowed),
+       description = resources!!.getString(R.string.emoji_image_picker_description)
+     )
+   }
+ }
+
+ override fun onImagesPicked(
+   filePaths: List<String>,
+   fromCamera: Boolean,
+   rejectedFilePaths: List<String>
+ ) {
+   doAfterAttach {
+     presenter.onImagesPicked(filePaths, rejectedFilePaths)
+   }
+ }
+
+ override fun onRequestPermissionsResult(
+   requestCode: Int,
+   permissions: Array<String?>,
+   grantResults: IntArray
+ ) {
+   if (requestCode == PermissionUtil.PERMISSION_IMAGES_STORAGE_REQUEST_CODE) {
+     if (PermissionUtil.checkAllPermissionsGranted(grantResults)) {
+       maxAllowedEmojiUploadImages?.let { openImagePicker(it) }
+     } else if (!PermissionUtil.showPermanentPermissionDenialDialog(
+         activity!!,
+         PermissionUtil.Permission.STORAGE
+       )
+     ) {
+       super.onRequestPermissionsResult(requestCode, permissions, grantResults)
+     }
+   } else {
+     super.onRequestPermissionsResult(requestCode, permissions, grantResults)
+   }
+ }
+
+ override fun showUploadEmojiRecoverableErrorMessage(recoverableFailedFiles: List<PreProcessedFile>) {
+   (activity as? RedditThemedActivity)?.run {
+     RedditToast.showToast(
+       activity = this,
+       model = ToastPresentationModel(
+         message = this.resources.getQuantityString(
+           R.plurals.powerups_upload_emoji_recoverable_error,
+           recoverableFailedFiles.size, recoverableFailedFiles.size
+         ),
+         isIndefinite = true,
+         accentColor = RedditToast.AccentColor.Error,
+         icon = RedditToast.Icon.Sad,
+         action = RedditToast.ToastButton(
+           label = getString(ThemesR.string.action_retry),
+           onClick = { presenter.onRetryUpload(recoverableFailedFiles) },
+           primaryStyle = true
+         )
+       )
+     )
+   }
+ }
+
+ override fun showUploadEmojiNonRecoverableErrorMessage(nonRecoverableFailuresCount: Int) {
+   (activity as? RedditThemedActivity)?.run {
+     RedditToast.showToast(
+       activity = this,
+       model = ToastPresentationModel(
+         message = resources.getQuantityString(
+           R.plurals.powerups_upload_emoji_non_recoverable_error,
+           nonRecoverableFailuresCount,
+           nonRecoverableFailuresCount
+         ),
+         accentColor = RedditToast.AccentColor.Error,
+         icon = RedditToast.Icon.Sad
+       )
+     )
+   }
+ }
+
+ override fun showDeleteEmojiErrorMessage(emote: Emote) {
+   (activity as? RedditThemedActivity?)?.run {
+     RedditToast.showToast(
+       activity = this,
+       model = ToastPresentationModel(
+         message = this.getString(R.string.delete_emoji_error),
+         isIndefinite = true,
+         accentColor = RedditToast.AccentColor.Error,
+         icon = RedditToast.Icon.Sad,
+         action = RedditToast.ToastButton(
+           label = this.getString(ThemesR.string.action_retry),
+           onClick = { presenter.onDeleteEmoteConfirm(emote) },
+           primaryStyle = true
+         )
+       )
+     )
+   }
+ }
+
+ private fun showEmojiDeleteTooltip() {
+   val targetPosition =
+     (emotesRecyclerView.adapter as? EmotesRecyclerAdapter)?.findFirstDeletableEmojiPosition()?.takeIf {
+       it != NO_POSITION
+     } ?: return
+   emotesRecyclerView.doOnLayout {
+     val firstDeletableEmoteView = emotesRecyclerView.layoutManager?.findViewByPosition(targetPosition) ?: return@doOnLayout
+
+     with(firstDeletableEmoteView.context) {
+       val model = CoachmarkUiModel.Anchored(
+         title = getString(R.string.powerups_emoji_tooltip_delete),
+         anchoringDirection = AnchoringDirection.BOTTOM,
+         tailGravity = TailGravity.CENTER
+       )
+
+       CoachmarkView(this).apply {
+         setup(model)
+         showAnchoredTo(firstDeletableEmoteView, followAnchorViewMovement = true)
+       }
+     }
+   }
+ }
+
+ override fun onOptionSelected(selectedOption: SelectOptionUiModel) {
+   val optionUiModel = selectedOption as SelectOptionUiModel.SelectOptionTextUiModel? ?: return
+   (optionUiModel.payload as? Emote)?.let {
+     presenter.onDeleteEmoteConfirm(it)
+   }
+ }
+
+ override fun showLoadErrorMessage() {
+   showErrorToast(ThemesR.string.error_fallback_message)
+ }
+
+ private fun enforceNewlineBefore(text: Editable, startIndex: Int) {
+   val hasNewline = (startIndex > 0 && text[startIndex - 1] == '\n')
+   if (hasNewline) return
+   val editText = getTextInputView()
+   if (editText.selectionStart <= startIndex) {
+     editText.setSelection(max(0, editText.selectionStart - 1))
+   }
+   text.insert(startIndex, "\n")
+ }
+
+ private fun enforceNewlineAfter(text: Editable, endIndex: Int) {
+   val hasNewline = (endIndex < text.length && text[endIndex] == '\n')
+   if (hasNewline) return
+   text.insert(endIndex, "\n")
+   val editText = getTextInputView()
+   editText.setSelection(min(text.length, endIndex + 1))
+ }
+
+ private fun updateEmoteSpansSize(emoteSpans: Iterable<ImageSpan>) {
+   emoteSpans.forEach {
+     val emote = emotesMap[it]
+     val sizePx = getEmotesSizePixels(binding.keyboardHeader.context, emote)
+     setNestedDrawableSize(it.drawable, sizePx)
+   }
+
+   // need to force update of the layout of the text, otherwise it can be wrong after spans resize
+   getTextInputView().apply {
+     disableTextWatcher = true
+     val savedSelectionEnd = selectionEnd
+     val textCopy = SpannableString(text)
+     text.clear()
+     text.append(textCopy)
+     setSelection(savedSelectionEnd)
+     disableTextWatcher = false
+   }
+ }
+
+ private fun getEmotesSizePixels(context: Context, emote: Emote?): Size {
+   val size =
+     emote?.let { markdownRenderer.getEmoteSizeDp(it, bigEmotes) } ?: getEmotesDefaultSizeDp().let { Size(it, it) }
+   val factor = context.resources.displayMetrics.density
+   return Size(
+     (size.width * factor).toInt(),
+     (size.height * factor).toInt()
+   )
+ }
+
+ private fun getEmotesDefaultSizeDp(): Int {
+   return if (bigEmotes) {
+     Emote.EMOTE_SIZE_BIG_DP
+   } else {
+     Emote.EMOTE_SIZE_SMALL_DP
+   }
+ }
+
+ private fun showLinkComposerModal() {
+   val addLinkDialog = LinkComposerAlertDialog.addLinkDialog(
+     getTextInputView().context!!
+   ) { nameText: String, linkText: String ->
+     updateTextInputView(nameText, linkText)
+     onLinkComposerInsertClicked()
+   }
+   addLinkDialog.setOnCancelListener { onLinkComposerDismissedClicked() }
+   addLinkDialog.show()
+   onLinkComposerOpened()
+   addLinkDialog.getButton(AlertDialog.BUTTON_POSITIVE).isEnabled = false
+ }
+
+ private fun updateTextInputView(nameText: String, linkText: String) {
+   val clickableText = LinkComposerAlertDialog.getClickableLink(linkText)
+   val cursorPosition = getTextInputView().selectionEnd
+   getTextInputView().text.insert(cursorPosition, "[$nameText]($clickableText)")
+   getTextInputView().setSelection(cursorPosition)
+ }
+
+ private fun onLinkComposerOpened() {
+   commentAnalytics.sendComposerClickEvent(
+     eventType = CommentEventBuilder.Noun.LINK,
+     sourceType = params.screenSourceForAnalytics
+   )
+ }
+
+ private fun onLinkComposerInsertClicked() {
+   commentAnalytics.sendComposerClickEvent(
+     eventType = CommentEventBuilder.Noun.INSERT,
+     sourceType = CommentEventBuilder.Source.LINK_COMPOSER
+   )
+ }
+
+ private fun onLinkComposerDismissedClicked() {
+   commentAnalytics.sendComposerClickEvent(
+     eventType = CommentEventBuilder.Noun.DISMISS,
+     sourceType = CommentEventBuilder.Source.LINK_COMPOSER
+   )
+ }
+
+ private fun setNestedDrawableSize(drawable: Drawable, sizePx: Size) {
+   drawable.setBounds(0, 0, sizePx.width, sizePx.height)
+   if (drawable is DrawableWrapper) {
+     val nestedDrawable = drawable.drawable ?: return
+     setNestedDrawableSize(nestedDrawable, sizePx)
+   }
+   if (drawable is LayerDrawable) {
+     for (i in 0 until drawable.numberOfLayers) {
+       val nestedDrawable = drawable.getDrawable(i)
+       setNestedDrawableSize(nestedDrawable, sizePx)
+     }
+   }
+ }
+
+ // TODO move it to some presenter delegate to be reused in ReplyPresenter etc?
+ /**
+  * If text contains any media content, returns it as markdown
+  */
+ fun getTextWithMediaAsMarkdown(): String? {
+   val replacements = mediaReplacements
+   if (replacements.isEmpty()) return null
+
+   return StringBuilder().apply {
+     append(text.substring(0, replacements.first().start))
+     append(replacementAsMarkdown(replacements.first()))
+     replacements.asSequence().windowed(2, 1).forEach {
+       val (replacementBefore, replacementAfter) = it
+       append(text.substring(replacementBefore.end, replacementAfter.start))
+       append(replacementAsMarkdown(replacementAfter))
+     }
+     append(text.substring(replacements.last().end, text.length))
+   }.toString()
+ }
+
+ private fun replacementAsMarkdown(replacement: MediaReplacement): String {
+   replacement.emote?.let { emote ->
+     val imageElementType = if (emote.imageType == Emote.IMAGE_TYPE_GIF) {
+       MARKDOWN_ELEMENT_EMOTE_GIF
+     } else {
+       MARKDOWN_ELEMENT_EMOTE_OTHER
+     }
+     return "![$imageElementType]($MARKDOWN_KEY_EMOTE|${emote.packId}|${emote.id})"
+   }
+   replacement.gif?.let { gif ->
+     val suffix = if (gifHasTrueDownsizedVariant(gif)) GIF_DOWNSIZED_ID_SUFFIX else ""
+     return "\n![$MARKDOWN_ELEMENT_GIF]($MARKDOWN_KEY_GIF|${gif.id}$suffix)\n"
+   }
+   return ""
+ }
+
+ /**
+  * By the spec which is at https://docs.google.com/document/d/1RzwnijIq2guBX4wisoV8g-76LU2WBtTTKRyo9kDJ_T4/edit#
+  * backend wants to know if the gif has the "downsized" variant, but it's not so simple to check
+  * because Giphy always adds this key, the only way to find if it's true and not fake is to
+  * look at the image URL.
+  *
+  * Quote from the spec:
+  * If the selected GIF has a downsized version then client adds “|downsized” postfix to the id,
+  * e.g. "giphy|4XSc0NkhKJQhW|downsized". If the suffix is not sent, R2 assumes the default
+  * 200px version must be used. It’s done to minimize gifs size which must be loaded by clients
+  * until mp4 functionality is not implemented.
+  *
+  */
+ private fun gifHasTrueDownsizedVariant(gif: Gif): Boolean {
+   return gif.downsizedImage?.gifUrl
+     ?.split('?', limit = 2)
+     ?.firstOrNull()
+     ?.endsWith(GIF_DOWNSIZED_URL_SUFFIX) ?: false
+ }
+
+ companion object {
+   private const val ARG_PARAMETERS = "arg_parameters"
+
+   private const val MAX_NUMBER_OF_BIG_EMOTES = 3
+
+   private const val EMOTE_SPAN_COUNT = 1
+
+   private const val GIFS_CONTENT_VIEW_POSITION = 0
+
+   private const val MARKDOWN_ELEMENT_EMOTE_GIF = "gif"
+   private const val MARKDOWN_ELEMENT_EMOTE_OTHER = "img"
+   private const val MARKDOWN_ELEMENT_GIF = "gif"
+   private const val MARKDOWN_KEY_EMOTE = "emote"
+   private const val MARKDOWN_KEY_GIF = "giphy"
+
+   const val GIF_DOWNSIZED_URL_SUFFIX = "giphy-downsized.gif"
+ }
+
+ private var View.layoutHeight: Int
+   get() = layoutParams.height
+   set(newValue) {
+     layoutParams = layoutParams.apply { height = newValue }
+   }
+}
